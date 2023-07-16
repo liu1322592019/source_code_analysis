@@ -103,10 +103,11 @@ inline PROTOBUF_ALWAYS_INLINE const char* TcParser::TagDispatch(
     PROTOBUF_TC_PARAM_NO_DATA_DECL) {
   // 读取两个byte
   const auto coded_tag = UnalignedLoad<uint16_t>(ptr);
-  // UInt32Value::_table_中fast_idx_mask是0
-  // 所以idx是0 ？？？
+  // fast_idx_mask是这么生成的
+  // (((1 << tc_table_info_->table_size_log2) - 1) << 3))
+  // 可以在pb.cc里面找到
   const size_t idx = coded_tag & table->fast_idx_mask;
-  // 后三位不能全是0, 这三位标识的是数据类型, 前置返回错误
+  // 生成的时候是 <<3, 后三位肯定是0
   PROTOBUF_ASSUME((idx & 7) == 0);
 
   // idx右移三位对应aux_field_number, 找到一个FastFieldEntry用于解析
@@ -114,8 +115,8 @@ inline PROTOBUF_ALWAYS_INLINE const char* TcParser::TagDispatch(
   auto* fast_entry = table->fast_entry(idx >> 3);
   TcFieldData data = fast_entry->bits;
   data.data ^= coded_tag;
+
   // 使用指定的target()函数来解析, target()是包装Varint和Zigzag解析函数
-  // 在PopulateFastFieldEntry函数里写入
   PROTOBUF_MUSTTAIL return fast_entry->target()(PROTOBUF_TC_PARAM_PASS);
 }
 ```
@@ -142,9 +143,10 @@ PROTOBUF_ALWAYS_INLINE const char* TcParser::FastVarintS1(
   PROTOBUF_MUSTTAIL return ToTagDispatch(PROTOBUF_TC_PARAM_NO_DATA_PASS);
 }
 ```
-TODO: 仔细理解下
 
 从网上找了些资源，大概都只是说, 代码还是得自己看
 ```
 key = (field_number << 3) | wire_type
 ```
+
+一个很好的资源推荐 [链接](https://www.cnblogs.com/shine-lee/p/10701810.html)
