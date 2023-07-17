@@ -1,7 +1,8 @@
 [SDS-Redis字符串](#SDS-Redis字符串)
 
-[list-Redis链表](#list-Redis链表)
+[list&quicklist-Redis链表](#list&quicklist-Redis链表)
 
+[ziplist&listpack-Redis数组](#ziplist&listpack-Redis数组)
 
 
 ## SDS-Redis字符串
@@ -131,7 +132,105 @@ sds _sdsMakeRoomFor(sds s, size_t addlen, int greedy) {
 }
 ```
 
-## list-Redis链表
+## list&quicklist-Redis链表
+
+在redis的早些版本, 是直接使用链表的, 链表的实现相对简单, 相信大家看完下面的定义自然就知道了
+```C
+typedef struct listNode {
+    struct listNode *prev;
+    struct listNode *next;
+    void *value;
+} listNode;
+
+typedef struct list {
+    listNode *head;
+    listNode *tail;
+    void *(*dup)(void *ptr);
+    void (*free)(void *ptr);
+    int (*match)(void *ptr, void *key);
+    unsigned long len;
+} list;
+```
+链表每个节点之间的内存都是不连续的，意味着无法很好利用 CPU 缓存。能很好利用 CPU 缓存的数据结构就是数组，因为数组的内存是连续的，这样就可以充分利用 CPU 缓存来加速访问。
+
+为了解决这个问题, redis使用了全新版本的quicklist。
+
+首先我们看一下quicklist的定义
+```C
+typedef struct quicklistNode {
+    struct quicklistNode *prev;
+    struct quicklistNode *next;
+    unsigned char *entry; // 指向listpack
+    size_t sz;             /* entry size in bytes */
+
+    // 下面这四个byte描述的是listpack的特点，是否压缩和大小等
+    unsigned int count : 16;     /* count of items in listpack */
+    unsigned int encoding : 2;   /* RAW==1 or LZF==2 */
+    unsigned int container : 2;  /* PLAIN==1 or PACKED==2 */
+    unsigned int recompress : 1; /* was this node previous compressed? */
+    unsigned int attempted_compress : 1; /* node can't compress; too small */
+    unsigned int dont_compress : 1; /* prevent compression of entry that will be used later */
+    unsigned int extra : 9; /* more bits to steal for future usage */
+} quicklistNode;
+
+typedef struct quicklist {
+    quicklistNode *head;
+    quicklistNode *tail;
+    unsigned long count;        /* total count of all entries in all listpacks */
+    unsigned long len;          /* number of quicklistNodes */
+
+    // 相对list特殊的
+    signed int fill : QL_FILL_BITS;       /* fill factor for individual nodes */
+    unsigned int compress : QL_COMP_BITS; /* depth of end nodes not to compress;0=off */
+    unsigned int bookmark_count: QL_BM_BITS;
+    quicklistBookmark bookmarks[]; // 书签, 存储指向节点的指针, 几乎不使用或者说只对大节点使用
+} quicklist;
+```
+接下来我们通过quicklist的操作函数来实际感受一下它是怎么被使用的
+```C
+/* Add new entry to head node of quicklist.
+ *
+ * Returns 0 if used existing head.
+ * Returns 1 if new head created. */
+int quicklistPushHead(quicklist *quicklist, void *value, size_t sz) {
+    quicklistNode *orig_head = quicklist->head;
+
+    // 大buffer, 拷贝会比较耗时, 直接新建一个独享的PLAIN的node
+    if (unlikely(isLargeElement(sz))) {
+        __quicklistInsertPlainNode(quicklist, quicklist->head, value, sz, 0);
+        return 1;
+    }
+
+    // 还不是允许插在head entry里
+    // head entry 不存在 -> 不允许
+    // head entry 是PLAIN或者是large element -> 不允许
+    // head entry 还有足够空间 -> 不允许
+    // 其他 -> 允许
+    if (likely(_quicklistNodeAllowInsert(quicklist->head, quicklist->fill, sz))) {
+        // 插入到head entry里
+        quicklist->head->entry = lpPrepend(quicklist->head->entry, value, sz);
+        // 更新entry实际使用的byte
+        quicklistNodeUpdateSz(quicklist->head);
+    } else {
+        // 创建并插入到新entry里
+        quicklistNode *node = quicklistCreateNode();
+        node->entry = lpPrepend(lpNew(0), value, sz);
+        // 更新entry实际使用的byte
+        quicklistNodeUpdateSz(node);
+
+        // 把新entry插入到头部
+        _quicklistInsertNodeBefore(quicklist, quicklist->head, node);
+    }
+
+    // 更新count
+    quicklist->count++;
+    quicklist->head->count++;
+    return (orig_head != quicklist->head);
+}
+```
+一言以蔽之，quicklist就是节点是listpack的双向链表。
+
+## ziplist&listpack-Redis数组
 
 
 
