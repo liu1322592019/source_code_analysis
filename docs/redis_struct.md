@@ -4,6 +4,9 @@
 
 [ziplist&listpack-Redis数组](#ziplist&listpack-Redis数组)
 
+[dict-Redis哈希表](#dict-Redis哈希表)
+
+
 
 ## SDS-Redis字符串
 
@@ -234,18 +237,8 @@ int quicklistPushHead(quicklist *quicklist, void *value, size_t sz) {
 
 首先我们来看一下ziplist
 ```C
-/* Each entry in the ziplist is either a string or an integer. */
-typedef struct {
-    /* When string is used, it is provided with the length (slen). */
-    unsigned char *sval;
-    unsigned int slen;
-    /* When integer is used, 'sval' is NULL, and lval holds the value. */
-    long long lval;
-} ziplistEntry;
-
 /*
  * ZIPLIST的结构是:
- *
  *     <zlbytes> <zltail> <zllen> <entry> <entry> ... <entry> <zlend>
  *
  * <uint32_t zlbytes> ziplist占用的总buffer长度
@@ -387,8 +380,65 @@ unsigned char *__ziplistInsert(unsigned char *zl, unsigned char *p, unsigned cha
 
 现在我们已经大概了解了ziplist和它的小缺点，接下来我们看看它的继任者listpack，以及看看listpack是怎么解决ziplist的问题的。
 
+```C
+/*
+ * LISTPACK的结构是:
+ *
+ *     <lzbytes> <lzlen> <entry> <entry> ... <entry> <lzend>
+ *
+ *   <uint32_t lzbytes> listpack占用的总buffer长度
+ *   <uint16_t lzlen>   entry的个数
+ *   <uint8_t lzend>    标志ziplist的结束，值为0xFF
+ *
+ *   比起ziplist, 这里少了tail的偏移量，使用的时候是用lzbytes来便宜到末尾的，然后反推最后一项
+ */
 
+/*
+ * LISTPACK ENTRIES的结构是
+ *
+ *       <encoding> <data> <len>
+ *
+ *   相对于ziplist, 看起来像是简单的把每个entry的prevlen给了前一个entry
+ *   问题来了，len放在末尾的话, 它占用几个byte呢？是固定占用N个byte吗？
+ *       这样是不是就不够省内存，不够redis了？
+ *   还有一个不同是，ziplist的prevlen是包括上一个entry的所有长度的,
+ *       listpack的len只包含本entry的encoding和data的长度, why?
+ *   
+ *   这两个问题相信你看完下面的长度计算代码就清楚了.
+ */
+```
+接下来我们看看listpack是怎么编码len的
+```C
+/* Decode the backlen and returns it. If the encoding looks invalid (more than
+ * 5 bytes are used), UINT64_MAX is returned to report the problem. */
+static inline uint64_t lpDecodeBacklen(unsigned char *p) {
+    uint64_t val = 0;
+    uint64_t shift = 0;
+    do {
+        // 127 = Ob0111,1111, 128 = 0b1000,0000
+        // 每个byte的后7位存储的实际数字, 第一位是1表示这个没有结束，第一位是0表示结束
+        // 以这个数字为例 0b 0111,1111, 1001,1010
+        //                  |--------  |--------
+        //                  C    D     A    B
+        // 一开始指针指向A处, val值是后七个bit(B处), 即0b 001,1010, 第一个bit(A)是1表示长度未结束
+        // 第二轮指针指向C处, val值新增七个bit(D处), 将D偏移7个bit后与val取按位或(|)
+        //     得到val的新值 0b 111,1111, 001,1010, 第一个bit(C)是0表示长度结束
+        //                     --------  --------
+        //                         D         B
+        val |= (uint64_t)(p[0] & 127) << shift;
+        if (!(p[0] & 128)) break;
+        shift += 7;
+        p--;
+        if (shift > 28) return UINT64_MAX;
+    } while(1);
+    return val;
+}
+```
+看完这里感觉和protobuf的[Varint](protobuf.md#Pb字段的编解码)编解码很像
 
+## dict-Redis哈希表
+
+本章我们来看一下redis下差不多是最复杂的数据结构, 照例, 先看定义
 
 
 
