@@ -6,7 +6,7 @@
 
 [dict-Redis哈希表](#dict-Redis哈希表)
 
-
+[intset-Redis整数集合](#intset-Redis整数集合)
 
 ## SDS-Redis字符串
 
@@ -439,6 +439,267 @@ static inline uint64_t lpDecodeBacklen(unsigned char *p) {
 ## dict-Redis哈希表
 
 本章我们来看一下redis下差不多是最复杂的数据结构, 照例, 先看定义
+
+```C
+// dict的配置项, 存储一些操作函数
+typedef struct dictType {
+    uint64_t (*hashFunction)(const void *key);
+    void *(*keyDup)(dict *d, const void *key);
+    void *(*valDup)(dict *d, const void *obj);
+    int (*keyCompare)(dict *d, const void *key1, const void *key2);
+    void (*keyDestructor)(dict *d, void *key);
+    void (*valDestructor)(dict *d, void *obj);
+    int (*expandAllowed)(size_t moreMem, double usedRatio);
+
+    unsigned int no_value:1; // 表示是否是set
+    
+    unsigned int keys_are_odd:1; // 当时set的时候的一种优化使用
+
+    /* Allow each dict and dictEntry to carry extra caller-defined metadata. The
+     * extra memory is initialized to 0 when allocated. */
+    size_t (*dictEntryMetadataBytes)(dict *d);
+    size_t (*dictMetadataBytes)(void);
+    /* Optional callback called after an entry has been reallocated (due to
+     * active defrag). Only called if the entry has metadata. */
+    void (*afterReplaceEntry)(dict *d, dictEntry *entry);
+} dictType;
+
+// dictEntry的元素，或者说桶object
+struct dictEntry {
+    void *key;
+    union {
+        void *val;
+        uint64_t u64;
+        int64_t s64;
+        double d;
+    } v;
+    struct dictEntry *next;     /* Next entry in the same hash bucket. */
+    void *metadata[];           /* An arbitrary number of bytes (starting at a
+                                 * pointer-aligned address) of size as returned
+                                 * by dictType's dictEntryMetadataBytes(). */
+};
+
+struct dict {
+    dictType *type;
+
+    // 内部有两个实际的哈希表, 用于扩容等操作使用
+    dictEntry** ht_table[2];
+    unsigned long ht_used[2];
+
+    long rehashidx; /* -1的时候没有rehash，其他时候记录rehash的进度 */
+
+    /* Keep small vars at end for optimal (minimal) struct padding */
+    int16_t pauserehash; /* If >0 rehashing is paused (<0 indicates coding error) */
+    signed char ht_size_exp[2]; /* exponent of size. (size = 1<<exp) */
+
+    void *metadata[];           /* An arbitrary number of bytes (starting at a
+                                 * pointer-aligned address) of size as defined
+                                 * by dictType's dictEntryBytes. */
+};
+
+```
+接下来我们看看dict的基本操作
+
+- 插入和查找的函数
+```C
+/* Finds and returns the position within the dict where the provided key should
+ * be inserted using dictInsertAtPosition if the key does not already exist in
+ * the dict. If the key exists in the dict, NULL is returned and the optional
+ * 'existing' entry pointer is populated, if provided. */
+void *dictFindPositionForInsert(dict *d, const void *key, dictEntry **existing) {
+    unsigned long idx, table;
+    dictEntry *he;
+    uint64_t hash = dictHashKey(d, key);
+    if (existing) *existing = NULL;
+    // 如果正在rehash, 执行一步, 这里实现了rehash的分步操作，避免单次操作太耗时
+    if (dictIsRehashing(d)) _dictRehashStep(d);
+
+    /* Expand the hash table if needed */
+    // 判断是否需要扩容rehash
+    if (_dictExpandIfNeeded(d) == DICT_ERR)
+        return NULL;
+
+    for (table = 0; table <= 1; table++) {
+        idx = hash & DICTHT_SIZE_MASK(d->ht_size_exp[table]);
+        /* Search if this slot does not already contain the given key */
+        he = d->ht_table[table][idx];
+        while(he) {
+            // 遍历链表寻找
+            void *he_key = dictGetKey(he);
+            if (key == he_key || dictCompareKeys(d, key, he_key)) {
+                if (existing) *existing = he;
+                return NULL;
+            }
+            he = dictGetNext(he);
+        }
+        // 如果没在rehash, 就不用看第二个表了, 减少一次操作
+        if (!dictIsRehashing(d)) break;
+    }
+
+    /* If we are in the process of rehashing the hash table, the bucket is
+     * always returned in the context of the second (new) hash table. */
+    // 到这里就是没找到, 生成一个新的bucket返回
+    dictEntry **bucket = &d->ht_table[dictIsRehashing(d) ? 1 : 0][idx];
+    return bucket;
+}
+```
+在这里我们看到了
+```C
+int dictRehash(dict *d, int n) {
+    int empty_visits = n*10; /* Max number of empty buckets to visit. */
+    unsigned long s0 = DICTHT_SIZE(d->ht_size_exp[0]);
+    unsigned long s1 = DICTHT_SIZE(d->ht_size_exp[1]);
+    if (dict_can_resize == DICT_RESIZE_FORBID || !dictIsRehashing(d)) return 0;
+    if (dict_can_resize == DICT_RESIZE_AVOID && 
+        ((s1 > s0 && s1 / s0 < dict_force_resize_ratio) ||
+         (s1 < s0 && s0 / s1 < dict_force_resize_ratio)))
+    {
+        return 0;
+    }
+
+    while(n-- && d->ht_used[0] != 0) {
+        dictEntry *de, *nextde;
+
+        /* Note that rehashidx can't overflow as we are sure there are more
+         * elements because ht[0].used != 0 */
+        assert(DICTHT_SIZE(d->ht_size_exp[0]) > (unsigned long)d->rehashidx);
+        
+        // 遍历, 找到接下来第一个非空的entry => de
+        while(d->ht_table[0][d->rehashidx] == NULL) {
+            d->rehashidx++;
+            if (--empty_visits == 0) return 1;
+        }
+        de = d->ht_table[0][d->rehashidx];
+
+        /* Move all the keys in this bucket from the old to the new hash HT */
+        // 把这个bucket及链表后面的都挪到新table
+        while(de) {
+            uint64_t h;
+
+            nextde = dictGetNext(de);
+            void *key = dictGetKey(de);
+            /* Get the index in the new hash table */
+            if (d->ht_size_exp[1] > d->ht_size_exp[0]) {
+                // 扩容的话需要重新算hash值
+                h = dictHashKey(d, key) & DICTHT_SIZE_MASK(d->ht_size_exp[1]);
+            } else {
+                /* We're shrinking the table. The tables sizes are powers of
+                 * two, so we simply mask the bucket index in the larger table
+                 * to get the bucket index in the smaller table. */
+                // 因为表的大小都是2的指数, 缩容的情况不需要重新计算
+                h = d->rehashidx & DICTHT_SIZE_MASK(d->ht_size_exp[1]);
+            }
+
+            if (d->type->no_value) {
+                // 一些很redis的操作, 针对key指针可以有一些优化
+                // keys_are_odd保证 key是奇数 => 最后一个bit一定是1
+                // 而指针一定是奇数, 最后一个bit一定是0， 因为字节对齐吗 TODO: ??????
+                // 这里针对这个操作做了一个优化
+                if (d->type->keys_are_odd && !d->ht_table[1][h]) {
+                    /* Destination bucket is empty and we can store the key
+                     * directly without an allocated entry. Free the old entry
+                     * if it's an allocated entry.
+                     *
+                     * TODO: Add a flag 'keys_are_even' and if set, we can use
+                     * this optimization for these dicts too. We can set the LSB
+                     * bit when stored as a dict entry and clear it again when
+                     * we need the key back. */
+                    assert(entryIsKey(key));
+                    if (!entryIsKey(de)) zfree(decodeMaskedPtr(de));
+                    de = key;
+                } else if (entryIsKey(de)) {
+                    /* We don't have an allocated entry but we need one. */
+                    de = createEntryNoValue(key, d->ht_table[1][h]);
+                } else {
+                    // 插到新表的entry的前面
+                    /* Just move the existing entry to the destination table and
+                     * update the 'next' field. */
+                    assert(entryIsNoValue(de));
+                    dictSetNext(de, d->ht_table[1][h]);
+                }
+            } else {
+                // 插到新表的entry的前面
+                dictSetNext(de, d->ht_table[1][h]);
+            }
+
+            // 把这个entry挪到新的table, 并更新相关统计量. 然后移动到链表的下一个entry
+            d->ht_table[1][h] = de;
+            d->ht_used[0]--;
+            d->ht_used[1]++;
+            de = nextde;
+        }
+        d->ht_table[0][d->rehashidx] = NULL;
+        d->rehashidx++;
+    }
+
+    /* Check if we already rehashed the whole table... */
+    // 判断是否rehash完成, 完成的话切换表
+    if (d->ht_used[0] == 0) {
+        zfree(d->ht_table[0]);
+        /* Copy the new ht onto the old one */
+        d->ht_table[0] = d->ht_table[1];
+        d->ht_used[0] = d->ht_used[1];
+        d->ht_size_exp[0] = d->ht_size_exp[1];
+        _dictReset(d, 1);
+        d->rehashidx = -1;
+        return 0;
+    }
+
+    /* More to rehash... */
+    return 1;
+}
+```
+接下来我们看看redis的另一个核心逻辑, iter迭代器
+```C
+dictEntry *dictNext(dictIterator *iter)
+{
+    while (1) {
+        if (iter->entry == NULL) {
+            // 首次迭代
+            if (iter->index == -1 && iter->table == 0) {
+                if (iter->safe)
+                    dictPauseRehashing(iter->d);
+                else
+                    iter->fingerprint = dictFingerprint(iter->d);
+            }
+            iter->index++;
+            if (iter->index >= (long) DICTHT_SIZE(iter->d->ht_size_exp[iter->table])) {
+                // index超过表的size
+                if (dictIsRehashing(iter->d) && iter->table == 0) {
+                    // 如果正在rehash, 且我们在ht_0, 这个时候可能是扩容, 切换到ht_1去试试
+                    iter->table++;
+                    iter->index = 0;
+                } else {
+                    // 没有在rehash, 表明已经迭代完了!
+                    break;
+                }
+            }
+            // 跳转到当前表的index++ || ht_0到ht_1的新开头
+            iter->entry = iter->d->ht_table[iter->table][iter->index];
+        } else {
+            // 非首次迭代
+            iter->entry = iter->nextEntry;
+        }
+
+        if (iter->entry) {
+            // 找到了非空的entry, 设置下一个
+            /* We need to save the 'next' here, the iterator user
+             * may delete the entry we are returning. */
+            iter->nextEntry = dictGetNext(iter->entry);
+            return iter->entry;
+        }
+        // entry是空的, 继续找
+    }
+
+    // 迭代完了!!
+    return NULL;
+}
+```
+// TODO: 确认一下之前那个神奇的迭代操作是在哪里的
+
+## intset-Redis整数集合
+
+下一节我们看看简单的
 
 
 
