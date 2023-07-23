@@ -8,6 +8,8 @@
 
 [intset-Redis整数集合](#intset-Redis整数集合)
 
+[skiplist-Redis跳表](#skiplist-Redis跳表)
+
 ## SDS-Redis字符串
 
 首先看一下，SDS这一组数据结构, 5因为没有长度字段，所以实际上只用来表达空字符串。从8到64是实际存储的数据的结构，适用于不同长度的字符串存储。
@@ -699,9 +701,226 @@ dictEntry *dictNext(dictIterator *iter)
 
 ## intset-Redis整数集合
 
-下一节我们看看简单的
+```C
+typedef struct intset {
+    uint32_t encoding; // 编码方式, 主要是表明每个数字的长度
+    uint32_t length; // 元素个数, 个数 * 编码代表的长度 = 总长度
+    int8_t contents[];
+} intset;
+```
+我们看一下它的实际操作
+```C
+intset *intsetAdd(intset *is, int64_t value, uint8_t *success) {
+    // 编码单个的长度
+    uint8_t valenc = _intsetValueEncoding(value);
+    uint32_t pos;
+    if (success) *success = 1;
 
+    /* Upgrade encoding if necessary. If we need to upgrade, we know that
+     * this value should be either appended (if > 0) or prepended (if < 0),
+     * because it lies outside the range of existing values. */
+    // 是否需要扩容, 编码单个的长度升级
+    if (valenc > intrev32ifbe(is->encoding)) {
+        /* This always succeeds, so we don't need to curry *success. */
+        // 先升级, 再插入
+        return intsetUpgradeAndAdd(is,value);
+    } else {
+        /* Abort if the value is already present in the set.
+         * This call will populate "pos" with the right position to insert
+         * the value when it cannot be found. */
+        // 二分查找
+        if (intsetSearch(is,value,&pos)) {
+            // 已经存在的值，直接返回
+            if (success) *success = 0;
+            return is;
+        }
 
+        // 扩容并挪动元素
+        is = intsetResize(is,intrev32ifbe(is->length)+1);
+        if (pos < intrev32ifbe(is->length)) intsetMoveTail(is,pos,pos+1);
+    }
 
+    // 实际插入
+    _intsetSet(is,pos,value);
+    is->length = intrev32ifbe(intrev32ifbe(is->length)+1);
+    return is;
+}
+```
+我们在看一下这里的特殊case, 编码升级的情况, 先扩容后插入
+```C
+/* Upgrades the intset to a larger encoding and inserts the given integer. */
+static intset *intsetUpgradeAndAdd(intset *is, int64_t value) {
+    uint8_t curenc = intrev32ifbe(is->encoding);
+    uint8_t newenc = _intsetValueEncoding(value);
+    int length = intrev32ifbe(is->length);
+    int prepend = value < 0 ? 1 : 0;
 
+    /* First set new encoding and resize */
+    is->encoding = intrev32ifbe(newenc);
+    // 扩容
+    is = intsetResize(is,intrev32ifbe(is->length)+1);
 
+    /* Upgrade back-to-front so we don't overwrite values.
+    * Note that the "prepend" variable is used to make sure we have an empty
+    * space at either the beginning or the end of the intset. */
+    // 此时buffer后面是未初始化的, 前面存储实际数据, 从后往前遍历
+    // |--------old--------|------------------new----------------|
+    //            <-- |                                <-- |   
+    //              从此处取值                            放到此处
+    while(length--)
+        // _intsetGetEncoded获取当前的值，此处是把原先的值重新编码放在新的地方
+        _intsetSet(is,length+prepend,_intsetGetEncoded(is,length,curenc));
+
+    // 因为是扩容, 所以新的值一定是大于或小于原有的编码范围，只能从头或尾插入
+    /* Set the value at the beginning or the end. */
+    if (prepend)
+        _intsetSet(is,0,value);
+    else
+        _intsetSet(is,intrev32ifbe(is->length),value);
+
+    // 设置新的长度
+    is->length = intrev32ifbe(intrev32ifbe(is->length)+1);
+    return is;
+}
+```
+
+## skiplist-Redis跳表
+
+<img src="../image/redis_skiplist.webp" width="100%"/>
+
+先看定义
+```C
+// 跳表节点的数据结构
+typedef struct zskiplistNode {
+    sds ele;  // 存储元素值的字符串对象
+    double score;  // 元素的分数
+    struct zskiplistNode *backward;  // 后退指针，指向前一个节点
+    struct zskiplistLevel {
+        struct zskiplistNode *forward;  // 前进指针，指向下一个节点
+        unsigned long span;  // 跨度，表示该节点到下一个节点的距离
+    } level[];  // 层级数组，用于存储不同层级的前进指针和跨度
+} zskiplistNode;
+
+// 跳表的数据结构
+typedef struct zskiplist {
+    struct zskiplistNode *header, *tail;  // 头节点和尾节点
+    unsigned long length;  // 跳表的长度，即节点数量
+    int level;  // 当前跳表的最大层级
+} zskiplist;
+```
+我们首先看一下插入的处理，这里感觉理解起来比较模糊
+```C
+zskiplistNode *zslInsert(zskiplist *zsl, double score, sds ele) {
+    // update: 每一层的插入后的那个节点
+    zskiplistNode *update[ZSKIPLIST_MAXLEVEL], *x;
+    // rank: 每一层的跨度
+    unsigned long rank[ZSKIPLIST_MAXLEVEL];
+    int i, level;
+
+    serverAssert(!isnan(score));
+    x = zsl->header;
+
+    // 这里就是寻址的过程, 为插入做准备
+    for (i = zsl->level-1; i >= 0; i--) {
+        /* store rank that is crossed to reach the insert position */
+        rank[i] = i == (zsl->level-1) ? 0 : rank[i+1];
+        while (x->level[i].forward &&
+                (x->level[i].forward->score < score ||
+                    (x->level[i].forward->score == score &&
+                    sdscmp(x->level[i].forward->ele,ele) < 0)))
+        {
+            rank[i] += x->level[i].span;
+            x = x->level[i].forward;
+        }
+        update[i] = x;
+    }
+    /* we assume the element is not already inside, since we allow duplicated
+     * scores, reinserting the same element should never happen since the
+     * caller of zslInsert() should test in the hash table if the element is
+     * already inside or not. */
+    // 这里比较随机的给skiplist加了若干层
+    level = zslRandomLevel();
+    if (level > zsl->level) {
+        for (i = zsl->level; i < level; i++) {
+            rank[i] = 0;
+            update[i] = zsl->header;
+            update[i]->level[i].span = zsl->length;
+        }
+        // 升级level那么随便的吗？？？
+        zsl->level = level;
+    }
+    x = zslCreateNode(level,score,ele);
+    for (i = 0; i < level; i++) {
+        // 遍历每一层插入节点
+        x->level[i].forward = update[i]->level[i].forward;
+        update[i]->level[i].forward = x;
+
+        /* update span covered by update[i] as x is inserted here */
+        x->level[i].span = update[i]->level[i].span - (rank[0] - rank[i]);
+        update[i]->level[i].span = (rank[0] - rank[i]) + 1;
+    }
+
+    /* increment span for untouched levels */
+    for (i = level; i < zsl->level; i++) {
+        update[i]->level[i].span++;
+    }
+
+    // 头尾的处理
+    x->backward = (update[0] == zsl->header) ? NULL : update[0];
+    if (x->level[0].forward)
+        x->level[0].forward->backward = x;
+    else
+        zsl->tail = x;
+
+    zsl->length++;
+    return x;
+}
+```
+我们通过查找的过程来看一看使用原理
+```C
+unsigned long zslGetRank(zskiplist *zsl, double score, sds ele) {
+    zskiplistNode *x;
+    unsigned long rank = 0;
+    int i;
+
+    x = zsl->header;
+    // 从上层逐渐往下查找
+    for (i = zsl->level-1; i >= 0; i--) {
+        // 前进到本层里 小于等于且最接近 score和ele 的那个entry
+        while (x->level[i].forward &&
+            (x->level[i].forward->score < score ||
+                (x->level[i].forward->score == score &&
+                sdscmp(x->level[i].forward->ele,ele) <= 0))) {
+            rank += x->level[i].span;
+            x = x->level[i].forward;
+        }
+
+        // 如果score和value值相同, 则返回，否则进入下一次迭代 => 即下一个层级
+        /* x might be equal to zsl->header, so test if obj is non-NULL */
+        if (x->ele && x->score == score && sdscmp(x->ele,ele) == 0) {
+            return rank;
+        }
+    }
+    return 0;
+}
+```
+刚才我说redis是随便升级level的吗？为了解决这个问题，我们来看一下zslRandomLevel
+```C
+* Returns a random level for the new skiplist node we are going to create.
+ * The return value of this function is between 1 and ZSKIPLIST_MAXLEVEL
+ * (both inclusive), with a powerlaw-alike distribution where higher
+ * levels are less likely to be returned. */
+int zslRandomLevel(void) {
+    static const int threshold = ZSKIPLIST_P*RAND_MAX; // ZSKIPLIST_P = 0.25
+    // 大概有25%的概率会增加一层, 计算一下期望，大概平均是1.33层
+    // 0.25^0   +    0.25^1     +   0.25^2       + ... + 0.25^无穷大 = 1.33
+    // 默认的1层   25%的概率+1层   25%^2的概率+1层                      期望值
+    int level = 1;
+    while (random() < threshold)
+        level += 1;
+    return (level<ZSKIPLIST_MAXLEVEL) ? level : ZSKIPLIST_MAXLEVEL;
+}
+```
+所以说redis也不是那么的随意, 而且看起来，这个期望值还是蛮低的，所以skiplist并不会显著的增大level
+
+至此我们已经看完了redis的基本数据结构，接下来请移步下一章，了解一下redis的内存分配等问题

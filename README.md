@@ -5,3 +5,4 @@
 
 * Redis
   * [Redis基本数据结构](docs/redis_struct.md)
+  * [Redis内存管理](docs/redis_mem.md)
