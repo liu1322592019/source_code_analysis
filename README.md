@@ -11,5 +11,6 @@
 
 * MySQL
   * [回表会牺牲多少性能？](docs/mysql_loopup_table.md)
+  * [select * 需要展开吗？](docs/mysql_select_all.md)
 
 
